@@ -5,84 +5,126 @@ import { cookies } from 'next/headers'
 export async function POST(request: NextRequest) {
   try {
     const supabase = createRouteHandlerClient({ cookies })
-    
-    // Get authenticated user
-    const { data: { user }, error: userError } = await supabase.auth.getUser()
-    
+
+    // 1) Auth: require a signed-in user
+    const {
+      data: { user },
+      error: userError,
+    } = await supabase.auth.getUser()
+
     if (userError || !user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    // 2) Parse body
     const { userId, variantId } = await request.json()
-    
+
     if (!userId || !variantId) {
-      return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
+      return NextResponse.json({ error: 'Missing required fields: userId, variantId' }, { status: 400 })
     }
 
-    // Verify the user ID matches the authenticated user
+    // 3) Verify request.userId matches the authenticated user
     if (userId !== user.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    console.log('💳 Creating Lemon Squeezy embedded checkout for user:', userId)
+    // 4) Basic env checks
+    const apiKey = process.env.LEMON_SQUEEZY_API_KEY
+    const storeId = process.env.LEMON_SQUEEZY_STORE_ID
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'
 
-    // Create Lemon Squeezy embedded checkout session
-    const successUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/checkout/success`
-    
-    const checkoutData = {
+    if (!apiKey || !storeId) {
+      return NextResponse.json(
+        { error: 'Lemon Squeezy misconfigured: missing API key or store ID' },
+        { status: 500 }
+      )
+    }
+
+    const successUrl = `${appUrl}/checkout/success`
+
+    // 5) Build JSON:API-compliant payload
+    const checkoutPayload = {
       data: {
         type: 'checkouts',
         attributes: {
-          store_id: parseInt(process.env.LEMON_SQUEEZY_STORE_ID || '0'),
-          variant_id: parseInt(variantId),
-          checkout_data: {
-            email: user.email,
-            custom: {
-              user_id: userId
-            }
+          // Opens as overlay with Lemon.js if you prefer (optional)
+          checkout_options: { embed: true },
+
+          // Where LS redirects AFTER a successful purchase
+          product_options: {
+            redirect_url: successUrl,
           },
-          success_url: successUrl,
-          redirect_url: successUrl
-        }
-      }
+
+          // Prefill & pass custom metadata
+          checkout_data: {
+            email: user.email ?? undefined,
+            custom: { user_id: userId },
+          },
+
+          // Optionally include test mode if you want to force it
+          // test_mode: process.env.NODE_ENV !== 'production',
+        },
+        relationships: {
+          store: {
+            data: {
+              type: 'stores',
+              id: String(storeId),
+            },
+          },
+          variant: {
+            data: {
+              type: 'variants',
+              id: String(variantId), // must be a string for JSON:API
+            },
+          },
+        },
+      },
     }
 
-    console.log('🔑 Using API key:', process.env.LEMON_SQUEEZY_API_KEY ? 'Present' : 'Missing')
-    console.log('🏪 Store ID:', process.env.LEMON_SQUEEZY_STORE_ID)
-
-    // Call Lemon Squeezy API to create embedded checkout
+    // 6) Call Lemon Squeezy with JSON:API headers
     const lemonResponse = await fetch('https://api.lemonsqueezy.com/v1/checkouts', {
       method: 'POST',
       headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.LEMON_SQUEEZY_API_KEY}`
+        Accept: 'application/vnd.api+json',
+        'Content-Type': 'application/vnd.api+json',
+        Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(checkoutData)
+      body: JSON.stringify(checkoutPayload),
+      // Recommended to avoid caching issues on some hosts
+      cache: 'no-store',
     })
 
+    const payload = await lemonResponse.json().catch(() => null)
+
     if (!lemonResponse.ok) {
-      const errorData = await lemonResponse.json()
-      console.error('❌ Lemon Squeezy API error:', errorData)
-      return NextResponse.json({ error: `Payment processing failed: ${errorData.errors?.[0]?.detail || 'Unknown error'}` }, { status: 500 })
+      const detail =
+        (payload as any)?.errors?.[0]?.detail ||
+        (payload as any)?.errors?.[0]?.title ||
+        'Unknown Lemon Squeezy error'
+      console.error('❌ Lemon Squeezy API error:', payload)
+      return NextResponse.json({ error: `Payment processing failed: ${detail}` }, { status: 500 })
     }
 
-    const lemonData = await lemonResponse.json()
-    const checkoutUrl = lemonData.data.attributes.url
-    const checkoutId = lemonData.data.id
+    // 7) Success: return the checkout URL + ID
+    const checkoutUrl = (payload as any)?.data?.attributes?.url
+    const checkoutId = (payload as any)?.data?.id
+
+    if (!checkoutUrl) {
+      console.error('Unexpected Lemon Squeezy response:', payload)
+      return NextResponse.json({ error: 'Payment processing failed: missing checkout URL' }, { status: 500 })
+    }
 
     console.log('✅ Lemon Squeezy embedded checkout created:', checkoutUrl)
     console.log('🆔 Checkout ID:', checkoutId)
-    
-    return NextResponse.json({ 
-      success: true,
-      checkoutUrl: checkoutUrl,
-      checkoutId: checkoutId,
-      message: 'Embedded checkout session created'
-    })
 
-  } catch (error) {
-    console.error('❌ Payment processing error:', error)
+    return NextResponse.json({
+      success: true,
+      checkoutUrl,
+      checkoutId,
+      message: 'Embedded checkout session created',
+    })
+  } catch (err) {
+    console.error('❌ Payment processing error:', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
